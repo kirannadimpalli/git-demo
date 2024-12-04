@@ -1,0 +1,124 @@
+import os
+import subprocess
+import json
+import boto3
+
+class MSIXManager:
+    def __init__(self, s3_bucket, s3_key):
+        self.s3_bucket = s3_bucket
+        self.s3_key = s3_key
+        self.msix_file_path = '/tmp/uploaded.msix'
+        self.preinstalled_apps = []
+        self.postinstall_apps = []
+        self.s3_client = boto3.client('s3')
+
+    def run(self):
+        self.download_msix_file()
+        self.preinstalled_apps = self.get_installed_applications()
+        self.install_msix_package()
+        self.postinstall_apps = self.get_installed_applications()
+        new_or_updated_apps = self.compare_applications()
+        self.save_applications_to_file('/tmp/preinstall.json', self.preinstalled_apps)
+        self.save_applications_to_file('/tmp/postinstall.json', self.postinstall_apps)
+
+        return {
+            "statusCode": 200,
+            "body": json.dumps(new_or_updated_apps, indent=4)
+        }
+
+    def download_msix_file(self):
+        """Downloads the MSIX file from S3 to the Lambda /tmp directory."""
+        try:
+            self.s3_client.download_file(self.s3_bucket, self.s3_key, self.msix_file_path)
+            print(f"Downloaded MSIX file from S3: {self.msix_file_path}")
+        except Exception as e:
+            print(f"Error downloading MSIX file from S3: {e}")
+            raise
+
+    def get_installed_applications(self):
+        """Retrieves a list of currently installed applications using PowerShell."""
+        try:
+            output = subprocess.check_output(['powershell', '-Command', 'Get-AppxPackage'])
+            return self.parse_applications(output.decode())
+        except Exception as e:
+            print(f"Error retrieving installed applications: {e}")
+            return []
+
+    def parse_applications(self, output):
+        """Parses the output of Get-AppxPackage to extract application details."""
+        applications = []
+        lines = output.splitlines()
+        app_details = {}
+
+        for line in lines:
+            if line:
+                key = line.split(':')[0].strip()
+                if key == "Name" and app_details:
+                    applications.append(app_details)
+                    app_details = {}
+                app_details[key] = line.split(':')[-1].strip()
+        
+        if app_details:
+            applications.append(app_details)
+
+        return applications
+
+    def install_msix_package(self):
+        """Installs the downloaded MSIX package using PowerShell."""
+        try:
+            if not os.path.exists(self.msix_file_path):
+                raise FileNotFoundError(f"MSIX file not found at {self.msix_file_path}")
+
+            subprocess.check_call(['powershell', '-Command', f'Add-AppxPackage -Path {self.msix_file_path}'])
+            print(f"MSIX package installed successfully: {self.msix_file_path}")
+        except Exception as e:
+            print(f"Error installing MSIX package: {e}")
+
+    def compare_applications(self):
+        """Compares the pre-install and post-install application lists to identify new or updated applications."""
+        pre_apps_dict = {app['PackageFamilyName']: app for app in self.preinstalled_apps if app.get("PackageFamilyName")}
+        new_or_changed_apps = []
+
+        for post_app in self.postinstall_apps:
+            family_name = post_app.get('PackageFamilyName')
+            if family_name in pre_apps_dict:
+                pre_app = pre_apps_dict[family_name]
+                if post_app.get('Version') != pre_app.get('Version'):
+                    new_or_changed_apps.append({
+                        "name": post_app.get("Name"),
+                        "previous_version": pre_app.get('Version'),
+                        "new_version": post_app.get('Version'),
+                        "package_family_name": post_app.get('PackageFamilyName'),
+                        "status": "Updated"
+                    })
+            else:
+                new_or_changed_apps.append({
+                    "name": post_app.get('Name'),
+                    "package_family_name": post_app.get('PackageFamilyName'),
+                    "version": post_app.get('Version'),
+                    "status": "New"
+                })
+        
+        return new_or_changed_apps
+
+    def save_applications_to_file(self, filename, applications):
+        """Saves application details to a JSON file."""
+        try:
+            with open(filename, 'w') as file:
+                file.write(json.dumps(applications, indent=4))
+            print(f"Saved applications to {filename}")
+        except Exception as e:
+            print(f"Error saving applications to file {filename}: {e}")
+
+
+def lambda_handler(event, context):
+    s3_bucket = event.get('s3_bucket')
+    s3_key = event.get('s3_key')
+
+    if not s3_bucket or not s3_key:
+        return {"statusCode": 400, "body": "S3 bucket and key must be provided in the event"}
+
+    msix_manager = MSIXManager(s3_bucket, s3_key)
+    result = msix_manager.run()
+    return result
+
